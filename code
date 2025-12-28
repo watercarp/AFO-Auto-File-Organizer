@@ -1,0 +1,242 @@
+import os
+import shutil
+from datetime import datetime
+import tkinter as tk
+from tkinter import filedialog, messagebox
+
+LOG_FILE = "log.txt"
+
+# =========================
+# 로그
+# =========================
+def write_log(message: str):
+    time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(f"[{time}] {message}\n")
+
+
+# =========================
+# 내용 기반 분류 규칙 (원하는 대로 키워드 추가/수정 가능)
+# =========================
+CATEGORY_RULES = {
+    "학교": ["수행평가", "탐구", "보고서", "발표", "실험", "프로젝트", "과제"],
+    "금융": ["영수증", "세금", "이체", "계좌", "카드", "invoice", "receipt", "견적", "청구"],
+    "개발": ["import", "class", "def", "error", "compile", "stm32", "flask", "api", "build", "linker"],
+}
+
+def classify_by_content(text: str):
+    """텍스트 내용 기반으로 카테고리 폴더 이름을 반환. 매칭 없으면 None."""
+    if not text:
+        return None
+
+    t = text.lower()
+    best_cat = None
+    best_score = 0
+
+    for cat, keywords in CATEGORY_RULES.items():
+        score = 0
+        for kw in keywords:
+            if kw.lower() in t:
+                score += 1
+        if score > best_score:
+            best_score = score
+            best_cat = cat
+
+    return best_cat if best_score > 0 else None
+
+
+# =========================
+# 텍스트 추출 (TXT/DOCX/PDF) - 스캔 PDF/이미지는 OCR 옵션에서 처리
+# =========================
+def extract_text_quick(file_path: str, ext_clean: str, max_chars: int = 20000) -> str:
+    ext = (ext_clean or "").lower()
+
+    try:
+        # 텍스트류
+        if ext in ["txt", "csv", "log", "md"]:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                return f.read(max_chars)
+
+        # DOCX
+        if ext == "docx":
+            from docx import Document  # pip install python-docx
+            doc = Document(file_path)
+            return ("\n".join(p.text for p in doc.paragraphs))[:max_chars]
+
+        # PDF (텍스트 PDF일 때만 잘 추출됨)
+        if ext == "pdf":
+            from pdfminer.high_level import extract_text  # pip install pdfminer.six
+            return (extract_text(file_path) or "")[:max_chars]
+
+    except Exception:
+        return ""
+
+    return ""
+
+
+# =========================
+# (선택) OCR: 이미지/스캔 PDF 대응
+# - 설치 필요: pip install pytesseract pillow
+# - 별도 설치: Tesseract 프로그램 설치 + PATH 설정
+# =========================
+def ocr_extract_text_if_possible(file_path: str, ext_clean: str, enable_ocr: bool, max_chars: int = 20000) -> str:
+    if not enable_ocr:
+        return ""
+
+    ext = (ext_clean or "").lower()
+    try:
+        import pytesseract  # pip install pytesseract
+        from PIL import Image  # pip install pillow
+
+        if ext in ["png", "jpg", "jpeg", "bmp", "tif", "tiff", "webp"]:
+            text = pytesseract.image_to_string(Image.open(file_path))
+            return (text or "")[:max_chars]
+
+        # 스캔 PDF OCR은 페이지 렌더링이 필요해서(추가 라이브러리/툴) 여기서는 생략
+        # 필요하면 pdf2image(poppler)까지 포함해서 확장 가능.
+
+    except Exception:
+        return ""
+
+    return ""
+
+
+# =========================
+# 중복 파일 처리: 동일 이름 있으면 (1)(2) 붙임
+# =========================
+def make_nonconflicting_path(target_dir: str, filename: str) -> str:
+    base, ext = os.path.splitext(filename)
+    candidate = os.path.join(target_dir, filename)
+    if not os.path.exists(candidate):
+        return candidate
+
+    i = 1
+    while True:
+        new_name = f"{base}({i}){ext}"
+        candidate = os.path.join(target_dir, new_name)
+        if not os.path.exists(candidate):
+            return candidate
+        i += 1
+
+
+# =========================
+# 정리 로직
+# =========================
+def organize_files(folder_path: str, use_extension: bool, use_content: bool, enable_ocr: bool):
+    if not folder_path:
+        messagebox.showwarning("경고", "폴더를 선택하세요.")
+        return
+
+    if not use_extension and not use_content:
+        messagebox.showwarning("경고", "정리 기준을 최소 1개 이상 선택하세요.")
+        return
+
+    moved = 0
+    skipped = 0
+
+    write_log("========== 정리 시작 ==========")
+    write_log(f"대상 폴더: {folder_path}")
+    write_log(f"옵션: 확장자 기준={use_extension}, 내용 기준={use_content}, OCR={enable_ocr}")
+
+    for filename in os.listdir(folder_path):
+        file_path = os.path.join(folder_path, filename)
+
+        # 폴더는 건너뜀 (이미 만들어진 분류 폴더 포함)
+        if not os.path.isfile(file_path):
+            continue
+
+        # 로그/실행파일 자신은 건너뜀(원하면 제거 가능)
+        if filename == LOG_FILE or filename.endswith(".py"):
+            continue
+
+        name, ext = os.path.splitext(filename)
+        ext_clean = ext[1:] if ext else "no_extension"
+
+        target_dir = None
+        reason = ""
+
+        # 1) 내용 기준 우선 적용(선택 시)
+        if use_content:
+            text = extract_text_quick(file_path, ext_clean)
+
+            # 텍스트 추출 실패했고 OCR 켰으면 이미지 OCR 시도
+            if not text and enable_ocr:
+                text = ocr_extract_text_if_possible(file_path, ext_clean, enable_ocr)
+
+            category = classify_by_content(text)
+            if category:
+                target_dir = os.path.join(folder_path, category)
+                reason = f"내용분류({category})"
+
+        # 2) 내용 기준으로 못 정했으면 확장자 기준(선택 시)
+        if target_dir is None and use_extension:
+            target_dir = os.path.join(folder_path, ext_clean)
+            reason = f"확장자({ext_clean})"
+
+        # 3) 둘 다 실패(예: 내용만 켰는데 매칭 없음)
+        if target_dir is None:
+            skipped += 1
+            write_log(f"SKIP: {filename} (분류 기준 매칭 없음)")
+            continue
+
+        os.makedirs(target_dir, exist_ok=True)
+        target_path = make_nonconflicting_path(target_dir, filename)
+
+        try:
+            shutil.move(file_path, target_path)
+            moved += 1
+            write_log(f"MOVE: {filename} -> {os.path.relpath(target_path, folder_path)} [{reason}]")
+        except Exception as e:
+            skipped += 1
+            write_log(f"FAIL: {filename} (이동 실패: {e})")
+
+    write_log(f"결과: 이동={moved}, 스킵/실패={skipped}")
+    write_log("========== 정리 완료 ==========\n")
+
+    messagebox.showinfo("완료", f"정리 완료!\n이동: {moved}\n스킵/실패: {skipped}\n\nlog.txt에 기록되었습니다.")
+
+
+# =========================
+# GUI
+# =========================
+def select_folder():
+    folder_selected = filedialog.askdirectory()
+    folder_path_var.set(folder_selected)
+
+def on_run():
+    organize_files(
+        folder_path=folder_path_var.get(),
+        use_extension=use_extension_var.get(),
+        use_content=use_content_var.get(),
+        enable_ocr=enable_ocr_var.get(),
+    )
+
+root = tk.Tk()
+root.title("Auto File Organizer (AFO)")
+root.geometry("520x260")
+
+folder_path_var = tk.StringVar()
+
+use_extension_var = tk.BooleanVar(value=True)
+use_content_var = tk.BooleanVar(value=True)
+enable_ocr_var = tk.BooleanVar(value=False)
+
+tk.Label(root, text="정리할 폴더 선택").pack(pady=8)
+
+row = tk.Frame(root)
+row.pack(pady=2)
+tk.Entry(row, textvariable=folder_path_var, width=52).pack(side=tk.LEFT, padx=5)
+tk.Button(row, text="폴더 선택", command=select_folder).pack(side=tk.LEFT)
+
+opt = tk.LabelFrame(root, text="정리 옵션", padx=10, pady=8)
+opt.pack(pady=10, fill="x", padx=12)
+
+tk.Checkbutton(opt, text="확장자 기준 정리 (pdf/jpg/txt 폴더 등)", variable=use_extension_var).pack(anchor="w")
+tk.Checkbutton(opt, text="내용(키워드) 기준 정리 (학교/금융/개발 등)", variable=use_content_var).pack(anchor="w")
+tk.Checkbutton(opt, text="OCR 사용 (이미지 글자 읽기) - 느릴 수 있음", variable=enable_ocr_var).pack(anchor="w")
+
+tk.Button(root, text="정리 시작", command=on_run, height=2, width=18).pack(pady=8)
+
+tk.Label(root, text="※ 결과는 log.txt에 저장됩니다.").pack()
+
+root.mainloop()
